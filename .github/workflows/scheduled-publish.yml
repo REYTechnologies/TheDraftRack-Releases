@@ -1,0 +1,113 @@
+# Publishes DRAFT releases of TheDraftRack Toolkit at the time written in their release text.
+#
+# Publish-TDRUpdate.ps1 -PublishAt 2026-11-24T23:00:00+05:30 creates the release as a draft and ends its text with
+#   <!-- publish-at: 2026-11-24T17:30:00Z -->
+# Every 15 minutes this workflow publishes (and makes "latest") each draft whose publish-at time has passed.
+# Drafts without that line and releases that are already published are never touched.
+# GitHub may start scheduled runs late (often 15-30 min); that is accepted.
+# This file must be on the default branch of the releases repository (schedules run only from there).
+
+name: Scheduled publish
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scheduled-publish
+  cancel-in-progress: false
+
+jobs:
+  publish-due-drafts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Publish drafts whose publish-at time has passed
+        shell: bash
+        run: |
+          set -uo pipefail
+          now=$(date -u +%s)
+          echo "Repository: $GH_REPO"
+          echo "UTC now:    $(date -u '+%Y-%m-%d %H:%M:%S')Z"
+
+          # one line per DRAFT: id <TAB> tag <TAB> publish-at (last marker in the body, or -) <TAB> has latest.json
+          if ! drafts=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq '
+                .[] | select(.draft == true) | [
+                  (.id | tostring),
+                  (if (.tag_name // "") == "" then "-" else .tag_name end),
+                  (([(.body // "") | match("<!--[[:space:]]*publish-at:[[:space:]]*([^[:space:]>]+)[[:space:]]*-->"; "g")] | last | .captures[0].string) // "-"),
+                  (any(.assets[]?; .name == "latest.json") | tostring)
+                ] | @tsv'); then
+            echo "::error::Could not list the releases of $GH_REPO."
+            exit 1
+          fi
+
+          if [ -z "$drafts" ]; then
+            echo "No draft releases. Nothing to do."
+            exit 0
+          fi
+
+          due=""
+          while IFS=$'\t' read -r id tag at haslatest; do
+            at=${at%$'\r'}; haslatest=${haslatest%$'\r'}
+            if [ "$tag" = "-" ]; then
+              echo "SKIP  draft id $id: it has no tag."
+              continue
+            fi
+            if [ "$at" = "-" ]; then
+              echo "SKIP  $tag (draft id $id): no publish-at line, left as it is."
+              continue
+            fi
+            if ! when=$(date -u -d "$at" +%s 2>/dev/null); then
+              echo "::warning::$tag (draft id $id): publish-at '$at' is not a valid time; skipped."
+              continue
+            fi
+            if [ "$when" -gt "$now" ]; then
+              echo "WAIT  $tag (draft id $id): publish-at $at, in $(( (when - now) / 60 )) min."
+              continue
+            fi
+            if [ "$haslatest" != "true" ]; then
+              echo "::warning::$tag (draft id $id) is due ($at) but has no latest.json asset; NOT published (incomplete upload?)."
+              continue
+            fi
+            echo "DUE   $tag (draft id $id): publish-at $at."
+            due+="$when $id $tag"$'\n'
+          done <<< "$drafts"
+
+          if [ -z "$due" ]; then
+            echo "Nothing is due."
+            exit 0
+          fi
+
+          # oldest publish-at first, so the newest due release ends up as "latest"
+          failed=0
+          while read -r when id tag; do
+            [ -z "${id:-}" ] && continue
+            # re-check right before publishing: never touch a release that is no longer a draft
+            state=$(gh api "repos/$GH_REPO/releases/$id" --jq '.draft' 2>/dev/null || echo "error")
+            if [ "$state" != "true" ]; then
+              echo "SKIP  $tag (id $id): no longer a draft (state: $state)."
+              continue
+            fi
+            echo "Publishing $tag (id $id) and making it latest ..."
+            # same as: gh release edit $tag --draft=false --latest (by id, so a draft can never be confused with another)
+            if gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=true \
+                 --jq '"PUBLISHED  \(.tag_name)  \(.html_url)  at \(.published_at)"'; then
+              echo "### Published $tag" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::Publishing $tag (id $id) failed."
+              failed=$((failed + 1))
+            fi
+          done < <(printf '%s' "$due" | sort -n)
+
+          if [ "$failed" -gt 0 ]; then
+            echo "$failed release(s) could not be published; the next run tries again."
+            exit 1
+          fi
